@@ -1,0 +1,476 @@
+--- nova/network/neutronv2/api.py	2016-06-02 14:44:12.351651053 +0530
++++ nova/network/neutronv2/api.py	2016-06-02 16:08:27.815765262 +0530
+@@ -1719,11 +1719,6 @@
+             current_neutron_port_map[current_neutron_port['id']] = (
+                 current_neutron_port)
+ 
+-        # In that case we should repopulate ports from the state of
+-        # Neutron.
+-        if not port_ids:
+-            port_ids = current_neutron_port_map.keys()
+-
+         for port_id in port_ids:
+             current_neutron_port = current_neutron_port_map.get(port_id)
+             if current_neutron_port:
+--- neutron/common/constants.py	2016-06-02 14:44:21.019651249 +0530
++++ neutron/common/constants.py	2016-06-02 16:08:27.823765262 +0530
+@@ -30,6 +30,10 @@
+ FLOATINGIP_STATUS_DOWN = 'DOWN'
+ FLOATINGIP_STATUS_ERROR = 'ERROR'
+ 
++DEVICE_OWNER_COMPUTE_PREFIX = "compute:"
++DEVICE_OWNER_NETWORK_PREFIX = "network:"
++DEVICE_OWNER_NEUTRON_PREFIX = "neutron:"
++
+ DEVICE_OWNER_ROUTER_HA_INTF = "network:router_ha_interface"
+ DEVICE_OWNER_ROUTER_INTF = "network:router_interface"
+ DEVICE_OWNER_ROUTER_GW = "network:router_gateway"
+@@ -38,11 +42,11 @@
+ DEVICE_OWNER_DVR_INTERFACE = "network:router_interface_distributed"
+ DEVICE_OWNER_AGENT_GW = "network:floatingip_agent_gateway"
+ DEVICE_OWNER_ROUTER_SNAT = "network:router_centralized_snat"
+-DEVICE_OWNER_LOADBALANCER = "neutron:LOADBALANCER"
+-DEVICE_OWNER_LOADBALANCERV2 = "neutron:LOADBALANCERV2"
++DEVICE_OWNER_LOADBALANCER = DEVICE_OWNER_NEUTRON_PREFIX + "LOADBALANCER"
++DEVICE_OWNER_LOADBALANCERV2 = DEVICE_OWNER_NEUTRON_PREFIX + "LOADBALANCERV2"
+ 
+-DEVICE_OWNER_COMPUTE_PREFIX = "compute:"
+-DEVICE_OWNER_PREFIXES = ["network:", "neutron:"]
++DEVICE_OWNER_PREFIXES = (DEVICE_OWNER_NETWORK_PREFIX,
++                         DEVICE_OWNER_NEUTRON_PREFIX)
+ 
+ # Collection used to identify devices owned by router interfaces.
+ # DEVICE_OWNER_ROUTER_HA_INTF is a special case and so is not included.
+--- neutron/plugins/ml2/drivers/linuxbridge/agent/linuxbridge_neutron_agent.py	2016-06-02 14:44:30.299651459 +0530
++++ neutron/plugins/ml2/drivers/linuxbridge/agent/linuxbridge_neutron_agent.py	2016-06-02 16:08:27.827765262 +0530
+@@ -459,12 +459,12 @@
+                                              network_id: network_id})
+ 
+     def add_tap_interface(self, network_id, network_type, physical_network,
+-                          segmentation_id, tap_device_name):
++                          segmentation_id, tap_device_name, device_owner):
+         """Add tap interface and handle interface missing exeptions."""
+         try:
+             return self._add_tap_interface(network_id, network_type,
+                                            physical_network, segmentation_id,
+-                                           tap_device_name)
++                                           tap_device_name, device_owner)
+         except Exception:
+             with excutils.save_and_reraise_exception() as ctx:
+                 if not ip_lib.device_exists(tap_device_name):
+@@ -475,7 +475,7 @@
+                     return False
+ 
+     def _add_tap_interface(self, network_id, network_type, physical_network,
+-                          segmentation_id, tap_device_name):
++                          segmentation_id, tap_device_name, device_owner):
+         """Add tap interface.
+ 
+         If a VIF has been plugged into a network, this function will
+@@ -501,9 +501,11 @@
+                 return False
+             self.ensure_tap_mtu(tap_device_name, phy_dev_name)
+ 
++        # Avoid messing with plugging devices into a bridge that the agent
++        # does not own
++        if device_owner.startswith(constants.DEVICE_OWNER_PREFIXES):
+         # Check if device needs to be added to bridge
+-        tap_device_in_bridge = self.get_bridge_for_tap_device(tap_device_name)
+-        if not tap_device_in_bridge:
++            if not self.get_bridge_for_tap_device(tap_device_name):
+             data = {'tap_device_name': tap_device_name,
+                     'bridge_name': bridge_name}
+             LOG.debug("Adding device %(tap_device_name)s to bridge "
+@@ -512,9 +514,11 @@
+                 return False
+         else:
+             data = {'tap_device_name': tap_device_name,
++                    'device_owner': device_owner,
+                     'bridge_name': bridge_name}
+-            LOG.debug("%(tap_device_name)s already exists on bridge "
+-                      "%(bridge_name)s", data)
++            LOG.debug("Skip adding device %(tap_device_name)s to "
++                      "%(bridge_name)s. It is owned by %(device_owner)s and "
++                      "thus added elsewhere.", data)
+         return True
+ 
+     def ensure_tap_mtu(self, tap_dev_name, phy_dev_name):
+@@ -523,14 +527,14 @@
+         ip_lib.IPDevice(tap_dev_name).link.set_mtu(phy_dev_mtu)
+ 
+     def add_interface(self, network_id, network_type, physical_network,
+-                      segmentation_id, port_id):
++                      segmentation_id, port_id, device_owner):
+         self.network_map[network_id] = NetworkSegment(network_type,
+                                                       physical_network,
+                                                       segmentation_id)
+         tap_device_name = self.get_tap_device_name(port_id)
+         return self.add_tap_interface(network_id, network_type,
+                                       physical_network, segmentation_id,
+-                                      tap_device_name)
++                                      tap_device_name, device_owner)
+ 
+     def delete_bridge(self, bridge_name):
+         if ip_lib.device_exists(bridge_name):
+@@ -973,12 +977,14 @@
+     def setup_linux_bridge(self, bridge_mappings, interface_mappings):
+         self.br_mgr = LinuxBridgeManager(bridge_mappings, interface_mappings)
+ 
+-    def remove_port_binding(self, network_id, physical_network, interface_id):
+-        bridge_name = self.br_mgr.get_existing_bridge_name(physical_network)
+-        if not bridge_name:
+-            bridge_name = self.br_mgr.get_bridge_name(network_id)
+-        tap_device_name = self.br_mgr.get_tap_device_name(interface_id)
+-        return self.br_mgr.remove_interface(bridge_name, tap_device_name)
++    def _ensure_port_admin_state(self, port_id, admin_state_up):
++        LOG.debug("Setting admin_state_up to %s for port %s",
++                  admin_state_up, port_id)
++        tap_name = self.br_mgr.get_tap_device_name(port_id)
++        if admin_state_up:
++            ip_lib.IPDevice(tap_name).link.set_up()
++        else:
++            ip_lib.IPDevice(tap_name).link.set_down()
+ 
+     def process_network_devices(self, device_info):
+         resync_a = False
+@@ -1022,18 +1028,58 @@
+                         device_details['port_id'])
+                     arp_protect.setup_arp_spoofing_protection(port,
+                                                               device_details)
+-                if device_details['admin_state_up']:
+                     # create the networking for the port
+                     network_type = device_details.get('network_type')
+                     segmentation_id = device_details.get('segmentation_id')
+-                    if self.br_mgr.add_interface(
+-                        device_details['network_id'],
+-                        network_type,
+-                        device_details['physical_network'],
+-                        segmentation_id,
+-                        device_details['port_id']):
+-
+-                        # update plugin about port status
++                tap_in_bridge = self.br_mgr.add_interface(
++                    device_details['network_id'], network_type,
++                    device_details['physical_network'], segmentation_id,
++                    device_details['port_id'], device_details['device_owner'])
++                # REVISIT(scheuran): Changed the way how ports admin_state_up
++                # is implemented.
++                #
++                # Old lb implementation:
++                # - admin_state_up: ensure that tap is plugged into bridge
++                # - admin_state_down: remove tap from bridge
++                # New lb implementation:
++                # - admin_state_up: set tap device state to up
++                # - admin_state_down: set tap device stae to down
++                #
++                # However both approaches could result in races with
++                # nova/libvirt and therefore to an invalid system state in the
++                # scenario, where an instance is booted with a port configured
++                # with admin_state_up = False:
++                #
++                # Libvirt does the following actions in exactly
++                # this order (see libvirt virnetdevtap.c)
++                #     1) Create the tap device, set its MAC and MTU
++                #     2) Plug the tap into the bridge
++                #     3) Set the tap online
++                #
++                # Old lb implementation:
++                #   A race could occur, if the lb agent removes the tap device
++                #   right after step 1). Then libvirt will add it to the bridge
++                #   again in step 2).
++                # New lb implementation:
++                #   The race could occur if the lb-agent sets the taps device
++                #   state to down right after step 2). In step 3) libvirt
++                #   might set it to up again.
++                #
++                # This is not an issue if an instance is booted with a port
++                # configured with admin_state_up = True. Libvirt would just
++                # set the tap device up again.
++                #
++                # This refactoring is recommended for the following reasons:
++                # 1) An existing race with libvirt caused by the behavior of
++                #    the old implementation. See Bug #1312016
++                # 2) The new code is much more readable
++                if tap_in_bridge:
++                    self._ensure_port_admin_state(
++                        device_details['port_id'],
++                        device_details['admin_state_up'])
++                # update plugin about port status if admin_state is up
++                if device_details['admin_state_up']:
++                    if tap_in_bridge:
+                         self.plugin_rpc.update_device_up(self.context,
+                                                          device,
+                                                          self.agent_id,
+@@ -1044,11 +1090,6 @@
+                                                            self.agent_id,
+                                                            cfg.CONF.host)
+                 else:
+-                    physical_network = device_details['physical_network']
+-                    self.remove_port_binding(device_details['network_id'],
+-                                             physical_network,
+-                                             device_details['port_id'])
+-            else:
+                 LOG.info(_LI("Device %s not defined on plugin"), device)
+         return False
+ 
+--- neutron/tests/unit/plugins/ml2/drivers/linuxbridge/agent/test_linuxbridge_neutron_agent.py	2016-06-02 14:44:39.011651655 +0530
++++ neutron/tests/unit/plugins/ml2/drivers/linuxbridge/agent/test_linuxbridge_neutron_agent.py	2016-06-02 16:08:27.831765262 +0530
+@@ -144,6 +144,7 @@
+ 
+     def test_treat_devices_removed_with_existed_device(self):
+         agent = self.agent
++        agent._ensure_port_admin_state = mock.Mock()
+         devices = [DEVICE_1]
+         with mock.patch.object(agent.plugin_rpc,
+                                "update_device_down") as fn_udd,\
+@@ -359,7 +360,7 @@
+                                                                   'tap4']))
+         agent.treat_devices_removed.assert_called_with(set(['tap1']))
+ 
+-    def test_treat_devices_added_updated_admin_state_up_true(self):
++    def test_treat_devices_added_updated_no_local_interface(self):
+         agent = self.agent
+         mock_details = {'device': 'dev123',
+                         'port_id': 'port123',
+@@ -367,38 +368,40 @@
+                         'admin_state_up': True,
+                         'network_type': 'vlan',
+                         'segmentation_id': 100,
+-                        'physical_network': 'physnet1'}
++                        'physical_network': 'physnet1',
++                        'device_owner': constants.DEVICE_OWNER_NETWORK_PREFIX}
++        agent.ext_manager = mock.Mock()
+         agent.plugin_rpc = mock.Mock()
+         agent.plugin_rpc.get_devices_details_list.return_value = [mock_details]
+-        agent.br_mgr = mock.Mock()
+-        agent.br_mgr.add_interface.return_value = True
+-        resync_needed = agent.treat_devices_added_updated(set(['tap1']))
+-
+-        self.assertFalse(resync_needed)
+-        agent.br_mgr.add_interface.assert_called_with('net123', 'vlan',
+-                                                      'physnet1', 100,
+-                                                      'port123')
+-        self.assertTrue(agent.plugin_rpc.update_device_up.called)
++        agent.mgr = mock.Mock()
++        agent.mgr.plug_interface.return_value = False
++        agent.mgr.ensure_port_admin_state = mock.Mock()
++        agent.treat_devices_added_updated(set(['tap1']))
++        self.assertFalse(agent.mgr.ensure_port_admin_state.called)
+ 
+-    def test_treat_devices_added_updated_admin_state_up_false(self):
++    def test_treat_devices_added_updated_admin_state_up_true(self):
+         agent = self.agent
+         mock_details = {'device': 'dev123',
+                         'port_id': 'port123',
+                         'network_id': 'net123',
+-                        'admin_state_up': False,
++                        'admin_state_up': True,
+                         'network_type': 'vlan',
+                         'segmentation_id': 100,
+-                        'physical_network': 'physnet1'}
++                        'physical_network': 'physnet1',
++                        'device_owner': constants.DEVICE_OWNER_NETWORK_PREFIX}
+         agent.plugin_rpc = mock.Mock()
+         agent.plugin_rpc.get_devices_details_list.return_value = [mock_details]
+-        agent.remove_port_binding = mock.Mock()
++        agent.br_mgr = mock.Mock()
++        agent.br_mgr.add_interface.return_value = True
++        agent._ensure_port_admin_state = mock.Mock()
+         resync_needed = agent.treat_devices_added_updated(set(['tap1']))
+ 
+         self.assertFalse(resync_needed)
+-        agent.remove_port_binding.assert_called_with('net123',
+-                                                     'physnet1',
+-                                                     'port123')
+-        self.assertFalse(agent.plugin_rpc.update_device_up.called)
++        agent.br_mgr.add_interface.assert_called_with(
++                                      'net123', 'vlan', 'physnet1',
++                                      100, 'port123',
++                                      constants.DEVICE_OWNER_NETWORK_PREFIX)
++        self.assertTrue(agent.plugin_rpc.update_device_up.called)
+ 
+     def test_treat_devices_added_updated_prevent_arp_spoofing_true(self):
+         agent = self.agent
+@@ -444,6 +447,23 @@
+             self.agent._report_state()
+             self.assertTrue(self.agent.fullsync)
+ 
++    def _test_ensure_port_admin_state(self, admin_state):
++        port_id = 'fake_id'
++        with mock.patch.object(ip_lib, 'IPDevice') as dev_mock:
++            self.agent._ensure_port_admin_state(port_id, admin_state)
++
++        tap_name = self.agent.br_mgr.get_tap_device_name(port_id)
++        self.assertEqual(admin_state,
++                         dev_mock(tap_name).link.set_up.called)
++        self.assertNotEqual(admin_state,
++                            dev_mock(tap_name).link.set_down.called)
++
++    def test_ensure_port_admin_state_up(self):
++        self._test_ensure_port_admin_state(True)
++
++    def test_ensure_port_admin_state_down(self):
++        self._test_ensure_port_admin_state(False)
++
+ 
+ class TestLinuxBridgeManager(base.BaseTestCase):
+     def setUp(self):
+@@ -886,12 +906,21 @@
+             self.assertRaises(RuntimeError, self.lbm.add_tap_interface, "123",
+                               p_const.TYPE_VLAN, "physnet1", None, "tap1")
+ 
+-    def test_add_tap_interface(self):
++    def test_add_tap_interface_owner_other(self):
++        with mock.patch.object(ip_lib, "device_exists"):
++            with mock.patch.object(self.lbm, "ensure_local_bridge"):
++                self.assertTrue(self.lbm.add_tap_interface("123",
++                                                           p_const.TYPE_LOCAL,
++                                                           "physnet1", None,
++                                                           "tap1", "foo"))
++
++    def test_add_tap_interface(self, dev_owner_prefix):
+         with mock.patch.object(ip_lib, "device_exists") as de_fn:
+             de_fn.return_value = False
+             self.assertFalse(
+                 self.lbm.add_tap_interface("123", p_const.TYPE_VLAN,
+-                                           "physnet1", "1", "tap1")
++                                           "physnet1", "1", "tap1",
++											dev_owner_prefix))
+             )
+ 
+             de_fn.return_value = True
+@@ -906,14 +935,16 @@
+                 self.assertTrue(self.lbm.add_tap_interface("123",
+                                                            p_const.TYPE_LOCAL,
+                                                            "physnet1", None,
+-                                                           "tap1"))
++                                                           "tap1",
++                                                           dev_owner_prefix))
+                 en_fn.assert_called_with("123", "brq123")
+ 
+                 self.lbm.bridge_mappings = {"physnet1": "brq999"}
+                 self.assertTrue(self.lbm.add_tap_interface("123",
+                                                            p_const.TYPE_LOCAL,
+                                                            "physnet1", None,
+-                                                           "tap1"))
++                                                           "tap1",
++                                                           dev_owner_prefix))
+                 en_fn.assert_called_with("123", "brq999")
+ 
+                 get_br.return_value = False
+@@ -921,8 +952,8 @@
+                 self.assertFalse(self.lbm.add_tap_interface("123",
+                                                             p_const.TYPE_LOCAL,
+                                                             "physnet1", None,
+-                                                            "tap1"))
+-
++                                                            "tap1",
++                                                            dev_owner_prefix))
+             with mock.patch.object(self.lbm,
+                                    "ensure_physical_in_bridge") as ens_fn,\
+                     mock.patch.object(self.lbm,
+@@ -933,21 +964,31 @@
+                 self.assertFalse(self.lbm.add_tap_interface("123",
+                                                             p_const.TYPE_VLAN,
+                                                             "physnet1", "1",
+-                                                            "tap1"))
++                                                            "tap1",
++                                                            dev_owner_prefix))
+ 
+                 ens_fn.return_value = "eth0.1"
+                 get_br.return_value = "brq123"
+                 self.lbm.add_tap_interface("123", p_const.TYPE_VLAN,
+-                                           "physnet1", "1", "tap1")
++                                           "physnet1", "1", "tap1",
++                                           dev_owner_prefix)
+                 en_mtu_fn.assert_called_once_with("tap1", "eth0.1")
+                 bridge_device.addif.assert_called_once_with("tap1")
+ 
++    def test_add_tap_interface_owner_network(self):
++        self._test_add_tap_interface(constants.DEVICE_OWNER_NETWORK_PREFIX)
++
++    def test_add_tap_interface_owner_neutron(self):
++        self._test_add_tap_interface(constants.DEVICE_OWNER_NEUTRON_PREFIX)
++
+     def test_add_interface(self):
+         with mock.patch.object(self.lbm, "add_tap_interface") as add_tap:
+             self.lbm.add_interface("123", p_const.TYPE_VLAN, "physnet-1",
+-                                   "1", "234")
++                                   "1", "234",
++                                   constants.DEVICE_OWNER_NETWORK_PREFIX)
+             add_tap.assert_called_with("123", p_const.TYPE_VLAN, "physnet-1",
+-                                       "1", "tap234")
++                                       "1", "tap234",
++                                       constants.DEVICE_OWNER_NETWORK_PREFIX)
+ 
+     def test_delete_bridge(self):
+         bridge_device = mock.Mock()
+--- nova/tests/unit/network/test_neutronv2.py	2016-06-02 14:44:46.623651827 +0530
++++ nova/tests/unit/network/test_neutronv2.py	2016-06-02 16:06:46.239762967 +0530
+@@ -722,6 +722,20 @@
+                                                port_data2,
+                                                None,
+                                                None)
++    def test_get_instance_nw_info_ignores_neutron_ports_empty_cache(self):
++        # Tests that ports returned from neutron that match the same
++        # instance_id/device_id are ignored when the instance info cache is
++        # empty.
++        port_data2 = copy.copy(self.port_data2)
++
++        # set device_id on the ports to be the same.
++        port_data2[1]['device_id'] = port_data2[0]['device_id']
++        network_cache = {'info_cache': {'network_info': []}}
++
++        self._fake_get_instance_nw_info_helper(network_cache,
++                                               port_data2,
++                                               None,
++                                               None)
+ 
+     def _fake_get_instance_nw_info_helper(self, network_cache,
+                                           current_neutron_ports,
+@@ -762,9 +776,27 @@
+                      'tenant_id': iface['network']['meta']['tenant_id']}
+                     for iface in ifaces]
+         if networks is None:
++            if ifaces:
+             self.moxed_client.list_networks(
+                 id=net_ids).AndReturn({'networks': nets})
+         else:
++                non_shared_nets = [
++                    {'id': iface['network']['id'],
++                     'name': iface['network']['label'],
++                     'tenant_id': iface['network']['meta']['tenant_id']}
++                    for iface in ifaces if not iface['shared']]
++                shared_nets = [
++                    {'id': iface['network']['id'],
++                     'name': iface['network']['label'],
++                     'tenant_id': iface['network']['meta']['tenant_id']}
++                    for iface in ifaces if iface['shared']]
++                self.moxed_client.list_networks(
++                    shared=False,
++                    tenant_id=self.instance['project_id']
++                        ).AndReturn({'networks': non_shared_nets})
++                self.moxed_client.list_networks(
++                    shared=True).AndReturn({'networks': shared_nets})
++        else:
+             networks = networks + [
+                 dict(id=iface['network']['id'],
+                      name=iface['network']['label'],
+@@ -2695,7 +2727,7 @@
+             tenant_id='fake', device_id='uuid').AndReturn(
+                 {'ports': fake_ports})
+ 
+-        mock_gather_port_ids_and_networks.return_value = (None, None)
++        mock_gather_port_ids_and_networks.return_value = ([], [])
+         mock_get_preexisting_port_ids.return_value = []
+         mock_nw_info_build_network.return_value = (None, None)
+         mock_nw_info_get_ips.return_value = []
+@@ -2706,7 +2738,7 @@
+ 
+         nw_infos = api._build_network_info_model(
+             self.context, fake_inst)
+-        self.assertEqual(len(nw_infos), 1)
++        self.assertEqual(len(nw_infos), 0)
+ 
+     def test_get_subnets_from_port(self):
+         api = neutronapi.API()
