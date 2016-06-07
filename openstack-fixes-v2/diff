@@ -41,8 +41,8 @@
  
  # Collection used to identify devices owned by router interfaces.
  # DEVICE_OWNER_ROUTER_HA_INTF is a special case and so is not included.
---- neutron/plugins/ml2/drivers/linuxbridge/agent/linuxbridge_neutron_agent.py	2016-06-02 14:44:30.299651459 +0530
-+++ neutron/plugins/ml2/drivers/linuxbridge/agent/linuxbridge_neutron_agent.py	2016-06-02 16:08:27.827765262 +0530
+--- neutron/plugins/ml2/drivers/linuxbridge/agent/linuxbridge_neutron_agent.py	2016-06-07 09:56:10.137019990 +0530
++++ neutron/plugins/ml2/drivers/linuxbridge/agent/linuxbridge_neutron_agent.py	2016-06-07 10:02:33.913028660 +0530
 @@ -459,12 +459,12 @@
                                               network_id: network_id})
  
@@ -67,7 +67,7 @@
          """Add tap interface.
  
          If a VIF has been plugged into a network, this function will
-@@ -501,9 +501,11 @@
+@@ -501,20 +501,24 @@
                  return False
              self.ensure_tap_mtu(tap_device_name, phy_dev_name)
  
@@ -77,12 +77,19 @@
          # Check if device needs to be added to bridge
 -        tap_device_in_bridge = self.get_bridge_for_tap_device(tap_device_name)
 -        if not tap_device_in_bridge:
+-            data = {'tap_device_name': tap_device_name,
+-                    'bridge_name': bridge_name}
+-            LOG.debug("Adding device %(tap_device_name)s to bridge "
+-                      "%(bridge_name)s", data)
+-            if bridge_lib.BridgeDevice(bridge_name).addif(tap_device_name):
+-                return False
 +            if not self.get_bridge_for_tap_device(tap_device_name):
-             data = {'tap_device_name': tap_device_name,
-                     'bridge_name': bridge_name}
-             LOG.debug("Adding device %(tap_device_name)s to bridge "
-@@ -512,9 +514,11 @@
-                 return False
++                data = {'tap_device_name': tap_device_name,
++                        'bridge_name': bridge_name}
++                LOG.debug("Adding device %(tap_device_name)s to bridge "
++                          "%(bridge_name)s", data)
++                if bridge_lib.BridgeDevice(bridge_name).addif(tap_device_name):
++                    return False
          else:
              data = {'tap_device_name': tap_device_name,
 +                    'device_owner': device_owner,
@@ -201,7 +208,7 @@
                          self.plugin_rpc.update_device_up(self.context,
                                                           device,
                                                           self.agent_id,
-@@ -1044,11 +1090,6 @@
+@@ -1044,12 +1090,7 @@
                                                             self.agent_id,
                                                             cfg.CONF.host)
                  else:
@@ -210,9 +217,11 @@
 -                                             physical_network,
 -                                             device_details['port_id'])
 -            else:
-                 LOG.info(_LI("Device %s not defined on plugin"), device)
+-                LOG.info(_LI("Device %s not defined on plugin"), device)
++                    LOG.info(_LI("Device %s not defined on plugin"), device)
          return False
  
+     def treat_devices_removed(self, devices):
 --- neutron/tests/unit/plugins/ml2/drivers/linuxbridge/agent/test_linuxbridge_neutron_agent.py	2016-06-02 14:44:39.011651655 +0530
 +++ neutron/tests/unit/plugins/ml2/drivers/linuxbridge/agent/test_linuxbridge_neutron_agent.py	2016-06-02 16:08:27.831765262 +0530
 @@ -144,6 +144,7 @@
